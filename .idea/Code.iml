@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="PYTHON_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/Py6S/envs/py6s" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/Py6S/envs/py6s/DLLs" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/Py6S/envs/py6s/Lib" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/Py6SV/envs/py6s/Lib/site-packages" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/py6s_only" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/Py6SV/envs/py6s" />
+    </content>
+    <orderEntry type="jdk" jdkName="Python 3.11 (Code) (2)" jdkType="Python SDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+  <component name="PyDocumentationSettings">
+    <option name="format" value="NUMPY" />
+    <option name="myDocStringFormat" value="NumPy" />
+  </component>
+  <component name="TestRunnerService">
+    <option name="PROJECT_TEST_RUNNER" value="py.test" />
+  </component>
+</module>
