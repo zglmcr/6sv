@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List, Set
 
 
 def parse_float(value: object) -> Optional[float]:
@@ -29,6 +29,14 @@ def parse_datetime(date_text: str, time_text: str) -> datetime:
         except ValueError:
             pass
     return datetime.fromisoformat(f"{date_text}T{time_text}").replace(tzinfo=timezone.utc)
+
+def tuple_to_set(data: Optional[Tuple[int, int]]) -> Optional[Set[int]]:
+    if data is not None:
+        data_min, data_max = data
+        # 生成闭区间所有数字集合
+        data_set = set(range(data_min, data_max + 1))
+        return data_set
+    return None
 
 
 def nearest_wavelength_value(
@@ -61,7 +69,7 @@ def interpolate_linear(values: Dict[float, float], target: float) -> float:
     pairs = sorted((wl, val) for wl, val in values.items() if math.isfinite(wl) and math.isfinite(val))
     if not pairs:
         raise ValueError("No values available for interpolation")
-    if target <= pairs[0][0]:
+    if target <= pairs[0][0]: # 目标波长超出输入范围时不做线性外推，而是使用最近端点值
         return pairs[0][1]
     if target >= pairs[-1][0]:
         return pairs[-1][1]
@@ -69,5 +77,5 @@ def interpolate_linear(values: Dict[float, float], target: float) -> float:
         if x0 <= target <= x1:
             if x1 == x0:
                 return y0
-            return y0 + (y1 - y0) * ((target - x0) / (x1 - x0))
+            return y0 + (y1 - y0) * ((target - x0) / (x1 - x0)) # 线性插值
     return pairs[-1][1]

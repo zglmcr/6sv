@@ -4,6 +4,8 @@ This folder keeps only the Py6S atmospheric-correction step.
 
 It assumes the input MODIS TOA sample CSV already exists.  The CSV must already contain matched sample time, location, solar/view geometry, and TOA reflectance bands.  This folder does not read MODIS L1B HDF files and does not run OCSSW.
 
+See `VALIDATION_GUIDE.md` for validated settings, quality filters, metrics, and known limits.
+
 ## Files
 
 - `ljn_ocid_py6s_correction.py`: main ljn `oc_id` matched MODIS/AERONET Py6S correction entrypoint.

@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Set, Tuple, Union
 
 from modules.common import nearest_wavelength_value, parse_datetime, parse_float
 
@@ -29,10 +29,16 @@ class LjnAeronetRecord:
     size_distribution: Dict[float, float]
     refr_real_by_um: Dict[float, float]
     refr_imag_by_um: Dict[float, float]
+    ssa_by_um: Dict[float, float]
+    absorption_aod_by_um: Dict[float, float]
     oc_products_by_um: Dict[float, Dict[str, float]]
     water_cm: Optional[float]
     ozone_dobson: Optional[float]
     no2_dobson: Optional[float]
+    wind_speed_ms: Optional[float]
+    chlorophyll_a_mg_m3: Optional[float]
+    oc_quality_level: str
+    inversion_quality_level: str
 
     def angstrom(self) -> Optional[float]:
         pairs = sorted((wl, aod) for wl, aod in self.aod_by_um.items() if wl > 0 and aod > 0)
@@ -132,7 +138,10 @@ def extract_oc_products(row: Dict[str, str]) -> Dict[float, Dict[str, float]]:
     return out
 
 
-def read_aeronet_index(path: Path) -> Dict[str, LjnAeronetRecord]:
+def read_aeronet_index(
+    path: Path,
+    wanted_oc_ids: Optional[Union[Set[str], Tuple[int, int]]] = None,
+) -> Dict[str, LjnAeronetRecord]:
     index: Dict[str, LjnAeronetRecord] = {}
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -140,10 +149,28 @@ def read_aeronet_index(path: Path) -> Dict[str, LjnAeronetRecord]:
             oc_id = (row.get("oc_id") or "").strip()
             if not oc_id:
                 continue
-            ordinary_aod = extract_wavelength_columns(row, r"Aerosol_Optical_Depth\[(\d+)nm\]")
-            inv_total = extract_wavelength_columns(row, r"inv_AOD_Extinction-Total\[(\d+)nm\]")
+            # if wanted_oc_ids is not None and oc_id not in wanted_oc_ids:
+            #     continue
+            if wanted_oc_ids is not None:
+                if isinstance(wanted_oc_ids, tuple):
+                    # 区间模式：min <= 当前ID <= max
+                    oc_min, oc_max = wanted_oc_ids
+                    if not (oc_min <= int(oc_id) <= oc_max):
+                        continue
+                else:
+                    # 原有集合匹配模式（兼容旧逻辑）
+                    if oc_id not in wanted_oc_ids:
+                        continue
+            '''
+            ordinary_aod（Direct Sun AOT）：来自太阳直射辐射衰减，是直接观测量，信噪比高、模型假设少，是 AERONET 公认的基准真值；
+            inv_total（inv_AOD_Extinction-Total）：是天空散射反演迭代后，由气溶胶粒径 / 折射率模型正向计算出的理论消光厚度，依赖气溶胶双模态、垂直廓线等先验假设，存在模型偏差；
+            当两者同波长共存时，直射观测更可靠，优先采信直射值。
+            为填充波长缺口，保证波长覆盖完整，先用inv_total打底，再用ordinary_aod覆盖
+            '''
+            ordinary_aod = extract_wavelength_columns(row, r"Aerosol_Optical_Depth\[(\d+)nm\]") #
+            inv_total = extract_wavelength_columns(row, r"inv_AOD_Extinction-Total\[(\d+)nm\]") # 仅四个波段
             aod_by_um = dict(inv_total)
-            aod_by_um.update(ordinary_aod)
+            aod_by_um.update(ordinary_aod) # 普通 AOD 覆盖反演总 AOD
             lat = parse_float(row.get("Site_Latitude(Degrees)"))
             lon = parse_float(row.get("Site_Longitude(Degrees)"))
             if lat is None or lon is None or not aod_by_um:
@@ -163,9 +190,17 @@ def read_aeronet_index(path: Path) -> Dict[str, LjnAeronetRecord]:
                 size_distribution=extract_size_distribution(row),
                 refr_real_by_um=extract_wavelength_columns(row, r"inv_Refractive_Index-Real_Part\[(\d+)nm\]"),
                 refr_imag_by_um=extract_wavelength_columns(row, r"inv_Refractive_Index-Imaginary_Part\[(\d+)nm\]"),
+                ssa_by_um=extract_wavelength_columns(row, r"inv_Single_Scattering_Albedo\[(\d+)nm\]"),
+                absorption_aod_by_um=extract_wavelength_columns(row, r"inv_Absorption_AOD\[(\d+)nm\]"),
                 oc_products_by_um=extract_oc_products(row),
                 water_cm=parse_float(row.get("Total_Precipitable_Water(cm)")),
                 ozone_dobson=parse_float(row.get("Total_Ozone(Du)")),
                 no2_dobson=parse_float(row.get("Total_NO2(DU)")),
+                wind_speed_ms=parse_float(row.get("Wind_Speed(m/s)")),
+                chlorophyll_a_mg_m3=parse_float(row.get("Chlorophyll-a")),
+                oc_quality_level=(row.get("Data_Quality_Level") or "").strip(),
+                inversion_quality_level=(row.get("inv_Inversion_Data_Quality_Level") or "").strip(),
             )
+            # if wanted_oc_ids is not None and len(index) == len(wanted_oc_ids):
+            #     break
     return index
