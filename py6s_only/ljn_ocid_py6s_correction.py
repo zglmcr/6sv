@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import csv
 import json
 import math
+from concurrent.futures import ProcessPoolExecutor
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -15,7 +17,7 @@ from itertools import islice
 from Py6S import AeroProfile
 from Py6S.sixs_exceptions import OutputParsingError
 
-from modules.aeronet import LjnAeronetRecord, read_aeronet_index
+from modules.aeronet import LjnAeronetRecord, passes_ljn_quality_control, read_aeronet_index
 from modules.common import interpolate_linear, nearest_oc_products, nearest_wavelength_value, parse_float, tuple_to_set
 from modules.modis import ModisSample, build_modis_sample, glint_angle_deg
 from modules.sixs_utils import (
@@ -131,6 +133,27 @@ OUTPUT_FIELDS = [
     "trans_total_scattering",
     "spherical_albedo",
 ]
+
+_WORKER_ARGS: Optional[argparse.Namespace] = None
+_WORKER_AERONET: Optional[Dict[str, LjnAeronetRecord]] = None
+_WORKER_BANDS: Optional[set[str]] = None
+
+
+def init_worker(
+    args: argparse.Namespace,
+    aeronet: Dict[str, LjnAeronetRecord],
+    bands: Optional[set[str]],
+) -> None:
+    global _WORKER_ARGS, _WORKER_AERONET, _WORKER_BANDS
+    _WORKER_ARGS = args
+    _WORKER_AERONET = aeronet
+    _WORKER_BANDS = bands
+
+
+def process_row_worker(modis_row: Dict[str, str]) -> Dict[str, object]:
+    if _WORKER_ARGS is None or _WORKER_AERONET is None:
+        raise RuntimeError("worker was not initialized")
+    return process_modis_row(_WORKER_ARGS, _WORKER_AERONET, _WORKER_BANDS, modis_row)
 
 
 def interpolate_aod(record: LjnAeronetRecord, wavelength_um: float) -> Tuple[float, float]:
@@ -376,7 +399,7 @@ def output_base_row(modis_row: Dict[str, str], sample: ModisSample, ljn: LjnAero
     }
 
 
-def process_rows(args: argparse.Namespace, aeronet: Dict[str, LjnAeronetRecord]) -> Dict[str, object]:
+def process_rows_serial_legacy(args: argparse.Namespace, aeronet: Dict[str, LjnAeronetRecord]) -> Dict[str, object]:
     counts: Counter[str] = Counter()
     aerosol_counts: Counter[str] = Counter()
     bands = {str(band) for band in args.bands} if args.bands else None
@@ -399,6 +422,9 @@ def process_rows(args: argparse.Namespace, aeronet: Dict[str, LjnAeronetRecord])
             if ljn is None:
                 counts["missing_aeronet_oc_id"] += 1
                 continue
+            if not passes_ljn_quality_control(ljn):
+                counts["quality_control_failed"] += 1
+                continue
             sample_bands = None if bands is None else bands | ({"1240"} if args.swir_residual_correction else set())
             sample = build_modis_sample(modis_row, sample_bands, args.reflectance_input) # 构建 MODIS Sample对象
             if sample is None:
@@ -406,7 +432,7 @@ def process_rows(args: argparse.Namespace, aeronet: Dict[str, LjnAeronetRecord])
                 continue
             global_aod_550 = get_global_550_aod(ljn)
             matched_records += 1
-            base = output_base_row(modis_row, sample, ljn)
+            base = output_base_row(modis_row, sample, ljn) # 基础信息，后面输出内容会基于这个增加新的结果字段信息
             swir_residual = float("nan")
             if args.swir_residual_correction and "1240" in sample.toa_by_band:
                 try:
@@ -492,8 +518,168 @@ def process_rows(args: argparse.Namespace, aeronet: Dict[str, LjnAeronetRecord])
     }
 
 
+def process_modis_row(
+    args: argparse.Namespace,
+    aeronet: Dict[str, LjnAeronetRecord],
+    bands: Optional[set[str]],
+    modis_row: Dict[str, str],
+) -> Dict[str, object]:
+    counts: Counter[str] = Counter()
+    aerosol_counts: Counter[str] = Counter()
+    output_rows: list[Dict[str, str]] = []
+
+    counts["modis_rows"] += 1
+    oc_id = (modis_row.get("oc_id") or "").strip()
+    if args.oc_id:
+        try:
+            oc_id_int = int(oc_id)
+        except ValueError:
+            counts["invalid_oc_id"] += 1
+            return {"counts": dict(counts), "aerosol_source_counts": {}, "rows": []}
+        if not (args.oc_id[0] <= oc_id_int <= args.oc_id[1]):
+            return {"counts": dict(counts), "aerosol_source_counts": {}, "rows": []}
+
+    ljn = aeronet.get(oc_id)
+    if ljn is None:
+        counts["missing_aeronet_oc_id"] += 1
+        return {"counts": dict(counts), "aerosol_source_counts": {}, "rows": []}
+    if not passes_ljn_quality_control(ljn):
+        counts["quality_control_failed"] += 1
+        return {"counts": dict(counts), "aerosol_source_counts": {}, "rows": []}
+
+    sample_bands = None if bands is None else bands | ({"1240"} if args.swir_residual_correction else set())
+    sample = build_modis_sample(modis_row, sample_bands, args.reflectance_input)
+    if sample is None:
+        counts["invalid_modis_sample"] += 1
+        return {"counts": dict(counts), "aerosol_source_counts": {}, "rows": []}
+
+    global_aod_550 = get_global_550_aod(ljn)
+    counts["matched_records"] += 1
+    base = output_base_row(modis_row, sample, ljn)
+    swir_residual = float("nan")
+    if args.swir_residual_correction and "1240" in sample.toa_by_band:
+        try:
+            swir = run_scattering(
+                args.sixs_path, sample, ljn, 1.240, args.aerosol_mode,
+                sample.toa_by_band["1240"], "1240", args.wavelength_mode, global_aod_550
+            )
+            swir_residual = float(swir["rho_water_leaving_6sv"])
+        except Exception:
+            counts["swir_residual_failed"] += 1
+
+    for band, rho_toa in sorted(sample.toa_by_band.items(), key=lambda item: float(item[0])):
+        if bands is not None and band not in bands:
+            continue
+        wavelength_um = float(band) / 1000.0
+        oc_wavelength_um, oc_values = nearest_oc_products(ljn.oc_products_by_um, wavelength_um)
+        try:
+            sca = run_scattering(
+                args.sixs_path,
+                sample,
+                ljn,
+                wavelength_um,
+                args.aerosol_mode,
+                rho_toa,
+                band,
+                args.wavelength_mode,
+                global_aod_550,
+            )
+        except Exception as exc:
+            counts[f"py6s_failed:{type(exc).__name__}"] += 1
+            continue
+        aerosol_counts[str(sca["aerosol_source"])] += 1
+        # This is only a diagnostic after removing additive path reflectance.
+        rho_minus_path = rho_toa - float(sca["rho_path_total"])
+        rho_surface_formula = solve_lambertian_surface_reflectance(rho_toa, sca)
+        rho_surface_py6s = float(sca.pop("rho_surface_lambertian_py6s"))
+        rho_surface = rho_surface_py6s if math.isfinite(rho_surface_py6s) else rho_surface_formula
+        rho_water = float(sca["rho_water_leaving_6sv"])
+        swir_applied = math.isfinite(swir_residual)
+        rho_water_swir = rho_water - swir_residual if swir_applied else rho_water
+        row = dict(base)
+        radiance_toa = parse_float(modis_row.get(f"radiance_{band}"))
+        rho_l1b = parse_float(modis_row.get(f"reflectance_{band}"))
+        row.update(
+            {
+                "band": band,
+                "wavelength_um": f"{wavelength_um:.6f}",
+                "oc_wavelength_um": f"{oc_wavelength_um:.6f}" if oc_wavelength_um is not None else "",
+                "oc_rho": format_value(oc_values.get("oc_rho", "")),
+                "oc_lw": format_value(oc_values.get("oc_lw", "")),
+                "oc_lwq": format_value(oc_values.get("oc_lwq", "")),
+                "oc_lwn": format_value(oc_values.get("oc_lwn", "")),
+                "oc_lwn_fq": format_value(oc_values.get("oc_lwn_fq", "")),
+                "oc_lwn_iop": format_value(oc_values.get("oc_lwn_iop", "")),
+                "radiance_toa": format_value(radiance_toa if radiance_toa is not None else ""),
+                "rho_l1b_reflectance_factor": format_value(rho_l1b if rho_l1b is not None else ""),
+                "solar_zenith_cosine": f"{math.cos(math.radians(sample.solar_z)):.8f}",
+                "rho_toa": f"{rho_toa:.8f}",
+                "rho_surface_minus_path": f"{rho_minus_path:.8f}",
+                "rho_toa_minus_atmosphere": f"{rho_minus_path:.8f}",
+                "rho_surface_lambertian": f"{rho_surface:.8f}",
+                "rho_water_leaving_6sv_swir_corrected": f"{rho_water_swir:.8f}",
+                "rho_swir_residual_6sv": f"{swir_residual:.8f}" if swir_applied else "",
+                "swir_residual_applied": "yes" if swir_applied else "no",
+            }
+        )
+        row.update({key: format_value(value) for key, value in sca.items()})
+        output_rows.append(row)
+        counts["output_rows"] += 1
+        counts["oc_product_matched"] += 1 if oc_wavelength_um is not None else 0
+        counts["oc_product_missing"] += 1 if oc_wavelength_um is None else 0
+
+    return {
+        "counts": dict(counts),
+        "aerosol_source_counts": dict(aerosol_counts),
+        "rows": output_rows,
+    }
+
+
+def process_rows(args: argparse.Namespace, aeronet: Dict[str, LjnAeronetRecord]) -> Dict[str, object]:
+    counts: Counter[str] = Counter()
+    aerosol_counts: Counter[str] = Counter()
+    bands = {str(band) for band in args.bands} if args.bands else None
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.modis_csv.open("r", encoding="utf-8-sig", newline="") as f_in, args.output.open("w", encoding="utf-8", newline="") as f_out:
+        reader = csv.DictReader(f_in)
+        writer = csv.DictWriter(f_out, fieldnames=OUTPUT_FIELDS)
+        writer.writeheader()
+        row_iter = reader
+        if args.max_rows is not None and args.max_rows > 0:
+            row_iter = islice(reader, args.max_rows)
+
+        if args.workers == 1:
+            results = (process_modis_row(args, aeronet, bands, modis_row) for modis_row in row_iter)
+            for result in results:
+                counts.update(result["counts"])
+                aerosol_counts.update(result["aerosol_source_counts"])
+                writer.writerows(result["rows"])
+        else:
+            with ProcessPoolExecutor(
+                max_workers=args.workers,
+                initializer=init_worker,
+                initargs=(args, aeronet, bands),
+            ) as executor:
+                for result in executor.map(process_row_worker, row_iter, chunksize=args.chunksize):
+                    counts.update(result["counts"])
+                    aerosol_counts.update(result["aerosol_source_counts"])
+                    writer.writerows(result["rows"])
+
+    return {
+        "counts": dict(counts),
+        "aerosol_source_counts": dict(aerosol_counts),
+        "output": str(args.output),
+        "aeronet_index_rows": len(aeronet),
+        "bands": sorted(bands, key=float) if bands else "all reflectance_* columns",
+        "workers": args.workers,
+        "chunksize": args.chunksize,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    default_workers = max(1, min(4, os.cpu_count() or 1))
     parser.add_argument("--modis-csv", type=Path, default=Path("Data/ljn/modis_l1b_result.csv"))
     parser.add_argument("--aeronet-csv", type=Path, default=Path("Data/ljn/lwn_with_aod_inv15_ocid.csv"))
     parser.add_argument("--output", type=Path, default=Path("Code/py6s_only/outputs/ljn_ocid_surface_reflectance.csv"))
@@ -501,6 +687,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sixs-path", type=Path, default=Path("Code/Py6SV/envs/py6s/Library/bin/sixs.exe"))
     parser.add_argument("--max-rows", type=int, help="Process only this many matched MODIS records.") #一般用站点、特定波段限制结果数量
     parser.add_argument("--oc-id", nargs=2, type=int, help="Process oc_id range, format: left right, e.g. 100 200")
+    parser.add_argument("--workers", type=int, default=default_workers, help="Number of worker processes. Use 1 for serial execution.")
+    parser.add_argument("--chunksize", type=int, default=1, help="Rows submitted to each worker task batch.")
     parser.add_argument("--bands", nargs="+", help="Limit MODIS reflectance bands, e.g. 412 443 488 555.")
     parser.add_argument("--aerosol-mode", choices=["auto", "inv", "fallback"], default="auto")
     parser.add_argument("--wavelength-mode", choices=["modis-rsr", "point"], default="modis-rsr")
@@ -517,6 +705,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.workers < 1:
+        raise SystemExit("--workers must be >= 1")
+    if args.chunksize < 1:
+        raise SystemExit("--chunksize must be >= 1")
     if not args.sixs_path.exists():
         raise SystemExit(f"Cannot find sixs executable: {args.sixs_path}")
     print(f"Loading AERONET index from {args.aeronet_csv}")

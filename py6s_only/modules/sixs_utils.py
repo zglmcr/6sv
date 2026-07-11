@@ -91,6 +91,7 @@ def configure_ocean_surface(s: SixS, record: LjnAeronetRecord, toa_reflectance: 
     '''配置 6SV 内置 Cox-Munk 粗糙海面 BRDF 模型'''
     wind_speed = record.wind_speed_ms if record.wind_speed_ms is not None else 2.0
     pigment = record.chlorophyll_a_mg_m3 if record.chlorophyll_a_mg_m3 is not None else 0.2
+    '''缺失风速时使用2m/s，缺失叶绿素时使用0.2mg/m3，风向固定为零，盐度固定使用 6SV 默认值。这些默认值会影响耀斑、白帽和水体分量'''
     s.ground_reflectance = GroundReflectance.HomogeneousOcean(
         max(0.0, wind_speed),
         0.0,

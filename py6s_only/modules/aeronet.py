@@ -39,6 +39,7 @@ class LjnAeronetRecord:
     chlorophyll_a_mg_m3: Optional[float]
     oc_quality_level: str
     inversion_quality_level: str
+    inv_time_diff_minutes: Optional[float]
 
     def angstrom(self) -> Optional[float]:
         pairs = sorted((wl, aod) for wl, aod in self.aod_by_um.items() if wl > 0 and aod > 0)
@@ -84,6 +85,12 @@ def parse_lwn_datetime(row: Dict[str, str]) -> datetime:
     if value:
         return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
     return parse_datetime(row.get("Date(dd-mm-yyyy)", ""), row.get("Time(hh:mm:ss)", ""))
+
+
+def passes_ljn_quality_control(record: LjnAeronetRecord, max_inv_time_diff_minutes: float = 180.0) -> bool:
+    if record.inv_time_diff_minutes is None:
+        return False
+    return abs(record.inv_time_diff_minutes) < max_inv_time_diff_minutes
 
 
 def extract_wavelength_columns(row: Dict[str, str], pattern: str) -> Dict[float, float]:
@@ -200,6 +207,7 @@ def read_aeronet_index(
                 chlorophyll_a_mg_m3=parse_float(row.get("Chlorophyll-a")),
                 oc_quality_level=(row.get("Data_Quality_Level") or "").strip(),
                 inversion_quality_level=(row.get("inv_Inversion_Data_Quality_Level") or "").strip(),
+                inv_time_diff_minutes=parse_float(row.get("inv_time_diff_minutes")),
             )
             # if wanted_oc_ids is not None and len(index) == len(wanted_oc_ids):
             #     break
