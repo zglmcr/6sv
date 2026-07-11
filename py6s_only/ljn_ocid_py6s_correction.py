@@ -19,7 +19,15 @@ from Py6S.sixs_exceptions import OutputParsingError
 
 from modules.aeronet import LjnAeronetRecord, passes_ljn_quality_control, read_aeronet_index
 from modules.common import interpolate_linear, nearest_oc_products, nearest_wavelength_value, parse_float, tuple_to_set
-from modules.modis import ModisSample, build_modis_sample, glint_angle_deg
+from modules.modis import (
+    ModisSample,
+    ModisSupplementRecord,
+    build_modis_sample,
+    default_modis_supplement_csv_path,
+    glint_angle_deg,
+    passes_modis_match_quality_control,
+    read_modis_supplement_index,
+)
 from modules.sixs_utils import (
     atmosphere_profile_name,
     configure_ocean_surface,
@@ -136,24 +144,39 @@ OUTPUT_FIELDS = [
 
 _WORKER_ARGS: Optional[argparse.Namespace] = None
 _WORKER_AERONET: Optional[Dict[str, LjnAeronetRecord]] = None
+_WORKER_MODIS_SUPPLEMENT: Optional[Dict[str, ModisSupplementRecord]] = None
 _WORKER_BANDS: Optional[set[str]] = None
 
 
 def init_worker(
     args: argparse.Namespace,
     aeronet: Dict[str, LjnAeronetRecord],
+    modis_supplement: Dict[str, ModisSupplementRecord],
     bands: Optional[set[str]],
 ) -> None:
-    global _WORKER_ARGS, _WORKER_AERONET, _WORKER_BANDS
+    global _WORKER_ARGS, _WORKER_AERONET, _WORKER_MODIS_SUPPLEMENT, _WORKER_BANDS
     _WORKER_ARGS = args
     _WORKER_AERONET = aeronet
+    _WORKER_MODIS_SUPPLEMENT = modis_supplement
     _WORKER_BANDS = bands
 
 
 def process_row_worker(modis_row: Dict[str, str]) -> Dict[str, object]:
-    if _WORKER_ARGS is None or _WORKER_AERONET is None:
+    if _WORKER_ARGS is None or _WORKER_AERONET is None or _WORKER_MODIS_SUPPLEMENT is None:
         raise RuntimeError("worker was not initialized")
-    return process_modis_row(_WORKER_ARGS, _WORKER_AERONET, _WORKER_BANDS, modis_row)
+    return process_modis_row(
+        _WORKER_ARGS,
+        _WORKER_AERONET,
+        _WORKER_MODIS_SUPPLEMENT,
+        _WORKER_BANDS,
+        modis_row,
+    )
+
+
+def modis_supplement_csv_path(args: argparse.Namespace) -> Path:
+    if args.modis_supplement_csv is not None:
+        return args.modis_supplement_csv
+    return default_modis_supplement_csv_path(args.modis_csv)
 
 
 def interpolate_aod(record: LjnAeronetRecord, wavelength_um: float) -> Tuple[float, float]:
@@ -399,7 +422,11 @@ def output_base_row(modis_row: Dict[str, str], sample: ModisSample, ljn: LjnAero
     }
 
 
-def process_rows_serial_legacy(args: argparse.Namespace, aeronet: Dict[str, LjnAeronetRecord]) -> Dict[str, object]:
+def process_rows_serial_legacy(
+    args: argparse.Namespace,
+    aeronet: Dict[str, LjnAeronetRecord],
+    modis_supplement: Dict[str, ModisSupplementRecord],
+) -> Dict[str, object]:
     counts: Counter[str] = Counter()
     aerosol_counts: Counter[str] = Counter()
     bands = {str(band) for band in args.bands} if args.bands else None
@@ -423,6 +450,9 @@ def process_rows_serial_legacy(args: argparse.Namespace, aeronet: Dict[str, LjnA
                 counts["missing_aeronet_oc_id"] += 1
                 continue
             if not passes_ljn_quality_control(ljn):
+                counts["quality_control_failed"] += 1
+                continue
+            if not passes_modis_match_quality_control(oc_id, modis_supplement):
                 counts["quality_control_failed"] += 1
                 continue
             sample_bands = None if bands is None else bands | ({"1240"} if args.swir_residual_correction else set())
@@ -521,6 +551,7 @@ def process_rows_serial_legacy(args: argparse.Namespace, aeronet: Dict[str, LjnA
 def process_modis_row(
     args: argparse.Namespace,
     aeronet: Dict[str, LjnAeronetRecord],
+    modis_supplement: Dict[str, ModisSupplementRecord],
     bands: Optional[set[str]],
     modis_row: Dict[str, str],
 ) -> Dict[str, object]:
@@ -544,6 +575,9 @@ def process_modis_row(
         counts["missing_aeronet_oc_id"] += 1
         return {"counts": dict(counts), "aerosol_source_counts": {}, "rows": []}
     if not passes_ljn_quality_control(ljn):
+        counts["quality_control_failed"] += 1
+        return {"counts": dict(counts), "aerosol_source_counts": {}, "rows": []}
+    if not passes_modis_match_quality_control(oc_id, modis_supplement):
         counts["quality_control_failed"] += 1
         return {"counts": dict(counts), "aerosol_source_counts": {}, "rows": []}
 
@@ -635,7 +669,11 @@ def process_modis_row(
     }
 
 
-def process_rows(args: argparse.Namespace, aeronet: Dict[str, LjnAeronetRecord]) -> Dict[str, object]:
+def process_rows(
+    args: argparse.Namespace,
+    aeronet: Dict[str, LjnAeronetRecord],
+    modis_supplement: Dict[str, ModisSupplementRecord],
+) -> Dict[str, object]:
     counts: Counter[str] = Counter()
     aerosol_counts: Counter[str] = Counter()
     bands = {str(band) for band in args.bands} if args.bands else None
@@ -650,7 +688,10 @@ def process_rows(args: argparse.Namespace, aeronet: Dict[str, LjnAeronetRecord])
             row_iter = islice(reader, args.max_rows)
 
         if args.workers == 1:
-            results = (process_modis_row(args, aeronet, bands, modis_row) for modis_row in row_iter)
+            results = (
+                process_modis_row(args, aeronet, modis_supplement, bands, modis_row)
+                for modis_row in row_iter
+            )
             for result in results:
                 counts.update(result["counts"])
                 aerosol_counts.update(result["aerosol_source_counts"])
@@ -659,7 +700,7 @@ def process_rows(args: argparse.Namespace, aeronet: Dict[str, LjnAeronetRecord])
             with ProcessPoolExecutor(
                 max_workers=args.workers,
                 initializer=init_worker,
-                initargs=(args, aeronet, bands),
+                initargs=(args, aeronet, modis_supplement, bands),
             ) as executor:
                 for result in executor.map(process_row_worker, row_iter, chunksize=args.chunksize):
                     counts.update(result["counts"])
@@ -681,6 +722,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     default_workers = max(1, min(4, os.cpu_count() or 1))
     parser.add_argument("--modis-csv", type=Path, default=Path("Data/ljn/modis_l1b_result.csv"))
+    parser.add_argument(
+        "--modis-supplement-csv",
+        type=Path,
+        help="MODIS supplement CSV with oc_id and abs_time_diff_minutes; defaults to modis_l1b_result_v2_rayleigh_rhos_1.csv next to --modis-csv.",
+    )
     parser.add_argument("--aeronet-csv", type=Path, default=Path("Data/ljn/lwn_with_aod_inv15_ocid.csv"))
     parser.add_argument("--output", type=Path, default=Path("Code/py6s_only/outputs/ljn_ocid_surface_reflectance.csv"))
     parser.add_argument("--summary-json", type=Path, default=Path("Code/py6s_only/outputs/ljn_ocid_surface_reflectance_summary.json"))
@@ -711,10 +757,19 @@ def main() -> int:
         raise SystemExit("--chunksize must be >= 1")
     if not args.sixs_path.exists():
         raise SystemExit(f"Cannot find sixs executable: {args.sixs_path}")
+    modis_supplement_csv = modis_supplement_csv_path(args)
+    if not modis_supplement_csv.exists():
+        raise SystemExit(f"Cannot find MODIS supplement CSV: {modis_supplement_csv}")
     print(f"Loading AERONET index from {args.aeronet_csv}")
     aeronet = read_aeronet_index(args.aeronet_csv, tuple(args.oc_id) if args.oc_id else None)
     print(f"Loaded {len(aeronet)} AERONET oc_id records")
-    summary = process_rows(args, aeronet)
+    print(f"Loading MODIS supplement index from {modis_supplement_csv}")
+    modis_supplement = read_modis_supplement_index(
+        modis_supplement_csv,
+        tuple(args.oc_id) if args.oc_id else None,
+    )
+    print(f"Loaded {len(modis_supplement)} MODIS supplement oc_id records")
+    summary = process_rows(args, aeronet, modis_supplement)
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)
     args.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"Wrote correction CSV to {args.output}")
